@@ -1,13 +1,18 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { TRAINING_DATASET, VALID_INTENTS } from '../constants';
+import { FirestoreService } from '../firebase/firestore.service';
+import {
+  InteractionLog,
+  AttemptDetail,
+} from '../interfaces/interaction-log.interface';
 
 @Injectable()
 export class AiService {
   private readonly logger = new Logger(AiService.name);
   private genAI: GoogleGenerativeAI;
 
-  constructor() {
+  constructor(private readonly firestoreService: FirestoreService) {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
       throw new Error('FATAL ERROR');
@@ -18,6 +23,7 @@ export class AiService {
   async evaluateMessageWithRetry(message: string, expectedIntent: string) {
     const MAX_ATTEMPTS = 3;
     const incorrectIntents: string[] = [];
+    const attemptHistory: AttemptDetail[] = [];
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       this.logger.log(`Intento ${attempt} de ${MAX_ATTEMPTS}`);
@@ -26,17 +32,52 @@ export class AiService {
 
       const aiResponseIntent = await this.callAIModel(prompt);
 
-      if (aiResponseIntent === expectedIntent) {
+      const wasCorrect = aiResponseIntent === expectedIntent;
+
+      attemptHistory.push({
+        attemptNumber: attempt,
+        prompt,
+        intentReturned: aiResponseIntent,
+        wasCorrect,
+      });
+
+      if (wasCorrect) {
+        await this.logInteraction({
+          message,
+          expectedIntent,
+          finalResult: 'ok',
+          attemptsUsed: attempt,
+          timestamp: new Date(),
+          attemptHistory,
+        });
+
         return { ok: true, intent: aiResponseIntent, attemptsUsed: attempt };
       }
 
       incorrectIntents.push(aiResponseIntent);
     }
 
+    await this.logInteraction({
+      message,
+      expectedIntent,
+      finalResult: 'error',
+      attemptsUsed: MAX_ATTEMPTS,
+      timestamp: new Date(),
+      attemptHistory,
+    });
+
     return {
       ok: false,
       error: 'IA did not match expected intent after 3 attempts',
     };
+  }
+
+  private async logInteraction(log: InteractionLog): Promise<void> {
+    try {
+      await this.firestoreService.saveInteractionLog(log);
+    } catch (error) {
+      this.logger.error('Failed to log interaction to Firestore', error);
+    }
   }
 
   private createRobustPrompt(
@@ -58,3 +99,4 @@ export class AiService {
     return text.trim();
   }
 }
+
